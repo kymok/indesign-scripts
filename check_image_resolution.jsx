@@ -6,6 +6,8 @@
 var NEWLINE = "\r";
 var PPI_TOLERANCE = 0.5;
 var XMP_NS_PHOTOSHOP = "http://ns.adobe.com/photoshop/1.0/";
+var XMP_NS_TIFF = "http://ns.adobe.com/tiff/1.0/";
+var TIFF_SCAN_BYTES = 262144;
 
 var RESOLUTION_RULES = {
     monochrome: [600, 1200],
@@ -99,6 +101,7 @@ function inspectDocument(doc) {
 
 function classifyImage(image) {
     var colorMode = getPhotoshopColorMode(image);
+    var tiffClassification = getTiffClassification(image);
     var imageTypeName = normalizeImageTypeName(safeRead(image, "imageTypeName"));
 
     if (colorMode === 0) {
@@ -115,6 +118,10 @@ function classifyImage(image) {
 
     if (colorMode === 2 || colorMode === 7 || colorMode === 8) {
         return buildClassification("unknown", "未判定", null, "XMP: 特殊カラーモード");
+    }
+
+    if (tiffClassification) {
+        return tiffClassification;
     }
 
     if (imageTypeName === "bitmap" || imageTypeName === "bilevel" || imageTypeName === "1bit") {
@@ -169,14 +176,7 @@ function buildClassification(kind, label, allowedValues, sourceLabel) {
 }
 
 function getPhotoshopColorMode(image) {
-    var link = safeRead(image, "itemLink");
-
-    if (!link || !isValidObject(link)) {
-        return null;
-    }
-
-    var linkXmp = safeRead(link, "linkXmp");
-
+    var linkXmp = getLinkXmp(image);
     if (!linkXmp || !isValidObject(linkXmp)) {
         return null;
     }
@@ -192,6 +192,404 @@ function getPhotoshopColorMode(image) {
     } catch (e) {
         return null;
     }
+}
+
+function getTiffClassification(image) {
+    var xmpMetadata = getTiffMetadataFromXmp(image);
+    var xmpClassification = classifyTiffMetadata(xmpMetadata, "TIFF XMP");
+
+    if (xmpClassification) {
+        return xmpClassification;
+    }
+
+    var fileMetadata = getTiffMetadataFromFile(image);
+    return classifyTiffMetadata(fileMetadata, "TIFFヘッダ");
+}
+
+function getTiffMetadataFromXmp(image) {
+    var linkXmp = getLinkXmp(image);
+
+    if (!linkXmp || !isValidObject(linkXmp)) {
+        return null;
+    }
+
+    var samplesPerPixel = getXmpNumericProperty(linkXmp, XMP_NS_TIFF, "tiff:SamplesPerPixel");
+    var photometricInterpretation = getXmpNumericProperty(linkXmp, XMP_NS_TIFF, "tiff:PhotometricInterpretation");
+    var bitsPerSample = getXmpBitsPerSample(linkXmp);
+
+    if (samplesPerPixel === null && photometricInterpretation === null && !bitsPerSample) {
+        return null;
+    }
+
+    return {
+        samplesPerPixel: samplesPerPixel,
+        photometricInterpretation: photometricInterpretation,
+        bitsPerSample: bitsPerSample
+    };
+}
+
+function getTiffMetadataFromFile(image) {
+    var file = getLinkedFile(image);
+
+    if (!file || !file.exists || !isTiffFilename(file.name)) {
+        return null;
+    }
+
+    var originalEncoding = file.encoding;
+    var binaryData = null;
+
+    try {
+        file.encoding = "BINARY";
+        if (!file.open("r")) {
+            return null;
+        }
+
+        binaryData = file.read(TIFF_SCAN_BYTES);
+    } catch (e) {
+        return null;
+    } finally {
+        try {
+            file.close();
+        } catch (e2) {}
+
+        try {
+            file.encoding = originalEncoding;
+        } catch (e3) {}
+    }
+
+    if (!binaryData || binaryData.length < 8) {
+        return null;
+    }
+
+    return parseTiffMetadata(binaryStringToBytes(binaryData));
+}
+
+function classifyTiffMetadata(metadata, sourceLabel) {
+    if (!metadata) {
+        return null;
+    }
+
+    var samplesPerPixel = asPositiveInteger(metadata.samplesPerPixel);
+    var photometric = asPositiveInteger(metadata.photometricInterpretation);
+    var bitDepth = getPrimaryBitDepth(metadata.bitsPerSample);
+    var suffix = buildTiffMetadataSuffix(samplesPerPixel, photometric, bitDepth);
+
+    if ((samplesPerPixel === 1 || photometric === 0 || photometric === 1) && bitDepth === 1) {
+        return buildClassification("monochrome", "モノクロ", RESOLUTION_RULES.monochrome, sourceLabel + suffix);
+    }
+
+    if (samplesPerPixel === 1 || photometric === 0 || photometric === 1) {
+        return buildClassification("grayscale", "グレー", RESOLUTION_RULES.grayscale, sourceLabel + suffix);
+    }
+
+    if (samplesPerPixel >= 3 || photometric === 2 || photometric === 3 || photometric === 5 || photometric === 6 || photometric === 8) {
+        return buildClassification("color", "カラー", RESOLUTION_RULES.color, sourceLabel + suffix);
+    }
+
+    return null;
+}
+
+function buildTiffMetadataSuffix(samplesPerPixel, photometric, bitDepth) {
+    var parts = [];
+
+    if (bitDepth !== null) {
+        parts.push("BitsPerSample=" + bitDepth);
+    }
+
+    if (samplesPerPixel !== null) {
+        parts.push("SamplesPerPixel=" + samplesPerPixel);
+    }
+
+    if (photometric !== null) {
+        parts.push("PhotometricInterpretation=" + photometric);
+    }
+
+    if (parts.length === 0) {
+        return "";
+    }
+
+    return " (" + parts.join(", ") + ")";
+}
+
+function getPrimaryBitDepth(bitsPerSample) {
+    if (!bitsPerSample || bitsPerSample.length === 0) {
+        return null;
+    }
+
+    var first = asPositiveInteger(bitsPerSample[0]);
+
+    if (first === null) {
+        return null;
+    }
+
+    for (var i = 1; i < bitsPerSample.length; i++) {
+        if (asPositiveInteger(bitsPerSample[i]) !== first) {
+            return first;
+        }
+    }
+
+    return first;
+}
+
+function asPositiveInteger(value) {
+    var numeric = Number(value);
+
+    if (isNaN(numeric) || numeric < 0) {
+        return null;
+    }
+
+    return Math.round(numeric);
+}
+
+function getLinkXmp(image) {
+    var link = safeRead(image, "itemLink");
+
+    if (!link || !isValidObject(link)) {
+        return null;
+    }
+
+    var linkXmp = safeRead(link, "linkXmp");
+    return linkXmp && isValidObject(linkXmp) ? linkXmp : null;
+}
+
+function getXmpNumericProperty(linkXmp, namespaceUri, propertyPath) {
+    if (!linkXmp) {
+        return null;
+    }
+
+    try {
+        var value = linkXmp.getProperty(namespaceUri, propertyPath);
+
+        if (value === null || typeof value === "undefined" || value === "") {
+            return null;
+        }
+
+        var numeric = Number(value);
+        return isNaN(numeric) ? null : numeric;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getXmpBitsPerSample(linkXmp) {
+    var directValue = getXmpNumericProperty(linkXmp, XMP_NS_TIFF, "tiff:BitsPerSample");
+    if (directValue !== null) {
+        return [directValue];
+    }
+
+    if (!hasMethod(linkXmp, "countContainer")) {
+        return null;
+    }
+
+    var count = 0;
+
+    try {
+        count = Number(linkXmp.countContainer(XMP_NS_TIFF, "tiff:BitsPerSample"));
+    } catch (e) {
+        count = 0;
+    }
+
+    if (!count || isNaN(count)) {
+        return null;
+    }
+
+    var bits = [];
+
+    for (var i = 1; i <= count; i++) {
+        var value = getXmpNumericProperty(linkXmp, XMP_NS_TIFF, "tiff:BitsPerSample[" + i + "]");
+        if (value === null) {
+            return null;
+        }
+        bits.push(value);
+    }
+
+    return bits.length > 0 ? bits : null;
+}
+
+function getLinkedFile(image) {
+    var link = safeRead(image, "itemLink");
+    if (!link || !isValidObject(link)) {
+        return null;
+    }
+
+    var filePath = safeRead(link, "filePath");
+    if (!filePath) {
+        return null;
+    }
+
+    try {
+        return File(filePath);
+    } catch (e) {
+        return null;
+    }
+}
+
+function isTiffFilename(name) {
+    if (!name) {
+        return false;
+    }
+
+    return /\.(tif|tiff)$/i.test(String(name));
+}
+
+function parseTiffMetadata(bytes) {
+    if (!bytes || bytes.length < 8) {
+        return null;
+    }
+
+    var littleEndian;
+
+    if (bytes[0] === 0x49 && bytes[1] === 0x49) {
+        littleEndian = true;
+    } else if (bytes[0] === 0x4D && bytes[1] === 0x4D) {
+        littleEndian = false;
+    } else {
+        return null;
+    }
+
+    var magic = readUint16(bytes, 2, littleEndian);
+    if (magic !== 42) {
+        return null;
+    }
+
+    var ifdOffset = readUint32(bytes, 4, littleEndian);
+    if (!isByteRangeAvailable(bytes, ifdOffset, 2)) {
+        return null;
+    }
+
+    var entryCount = readUint16(bytes, ifdOffset, littleEndian);
+    var metadata = {
+        bitsPerSample: null,
+        samplesPerPixel: null,
+        photometricInterpretation: null
+    };
+
+    for (var i = 0; i < entryCount; i++) {
+        var entryOffset = ifdOffset + 2 + (i * 12);
+        if (!isByteRangeAvailable(bytes, entryOffset, 12)) {
+            return null;
+        }
+
+        var tag = readUint16(bytes, entryOffset, littleEndian);
+        var values = readTiffEntryValues(bytes, entryOffset, littleEndian);
+
+        if (!values) {
+            continue;
+        }
+
+        if (tag === 258) {
+            metadata.bitsPerSample = values;
+        } else if (tag === 262 && values.length > 0) {
+            metadata.photometricInterpretation = values[0];
+        } else if (tag === 277 && values.length > 0) {
+            metadata.samplesPerPixel = values[0];
+        }
+    }
+
+    if (!metadata.bitsPerSample && metadata.samplesPerPixel === null && metadata.photometricInterpretation === null) {
+        return null;
+    }
+
+    return metadata;
+}
+
+function readTiffEntryValues(bytes, entryOffset, littleEndian) {
+    var fieldType = readUint16(bytes, entryOffset + 2, littleEndian);
+    var count = readUint32(bytes, entryOffset + 4, littleEndian);
+    var typeSize = getTiffFieldTypeSize(fieldType);
+
+    if (!typeSize || !count) {
+        return null;
+    }
+
+    var totalSize = typeSize * count;
+    var valueOffset = totalSize <= 4 ? entryOffset + 8 : readUint32(bytes, entryOffset + 8, littleEndian);
+
+    if (!isByteRangeAvailable(bytes, valueOffset, totalSize)) {
+        return null;
+    }
+
+    var values = [];
+
+    for (var i = 0; i < count; i++) {
+        var offset = valueOffset + (i * typeSize);
+
+        if (fieldType === 1 || fieldType === 6 || fieldType === 7) {
+            values.push(bytes[offset]);
+        } else if (fieldType === 3) {
+            values.push(readUint16(bytes, offset, littleEndian));
+        } else if (fieldType === 4) {
+            values.push(readUint32(bytes, offset, littleEndian));
+        } else {
+            return null;
+        }
+    }
+
+    return values;
+}
+
+function getTiffFieldTypeSize(fieldType) {
+    if (fieldType === 1 || fieldType === 2 || fieldType === 6 || fieldType === 7) {
+        return 1;
+    }
+
+    if (fieldType === 3 || fieldType === 8) {
+        return 2;
+    }
+
+    if (fieldType === 4 || fieldType === 9 || fieldType === 11) {
+        return 4;
+    }
+
+    if (fieldType === 5 || fieldType === 10 || fieldType === 12) {
+        return 8;
+    }
+
+    return 0;
+}
+
+function readUint16(bytes, offset, littleEndian) {
+    if (!isByteRangeAvailable(bytes, offset, 2)) {
+        return 0;
+    }
+
+    if (littleEndian) {
+        return bytes[offset] + (bytes[offset + 1] * 256);
+    }
+
+    return (bytes[offset] * 256) + bytes[offset + 1];
+}
+
+function readUint32(bytes, offset, littleEndian) {
+    if (!isByteRangeAvailable(bytes, offset, 4)) {
+        return 0;
+    }
+
+    if (littleEndian) {
+        return bytes[offset] +
+            (bytes[offset + 1] * 256) +
+            (bytes[offset + 2] * 65536) +
+            (bytes[offset + 3] * 16777216);
+    }
+
+    return (bytes[offset] * 16777216) +
+        (bytes[offset + 1] * 65536) +
+        (bytes[offset + 2] * 256) +
+        bytes[offset + 3];
+}
+
+function isByteRangeAvailable(bytes, offset, length) {
+    return offset >= 0 && length >= 0 && (offset + length) <= bytes.length;
+}
+
+function binaryStringToBytes(binaryString) {
+    var bytes = [];
+
+    for (var i = 0; i < binaryString.length; i++) {
+        bytes.push(binaryString.charCodeAt(i) & 0xFF);
+    }
+
+    return bytes;
 }
 
 function normalizeImageTypeName(value) {
@@ -553,6 +951,20 @@ function hasProperty(target, propertyName) {
 
     try {
         return reflection.find(propertyName) !== null;
+    } catch (e) {
+        return false;
+    }
+}
+
+function hasMethod(target, methodName) {
+    var reflection = getReflection(target);
+
+    if (!reflection) {
+        return false;
+    }
+
+    try {
+        return reflection.find(methodName) !== null;
     } catch (e) {
         return false;
     }
